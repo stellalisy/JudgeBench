@@ -144,9 +144,9 @@ class TogetherAPI(ChatAPI):
 
 class LocalAPI(ChatAPI):
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, port: int = 8000):
         self.model = model
-        self.client = openai.AsyncClient(base_url="http://localhost:8000/v1", api_key="EMPTY")
+        self.client = openai.AsyncClient(base_url=f"http://localhost:{port}/v1", api_key="EMPTY")
 
     @backoff.on_exception(backoff.fibo, (openai.OpenAIError), max_tries=5, max_value=30)
     async def chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
@@ -167,7 +167,7 @@ class LocalAPI(ChatAPI):
         return response.choices[0].text
 
 
-def get_chat_api_from_model(model: str) -> ChatAPI:
+def get_chat_api_from_model(model: str, port: int = 8000) -> ChatAPI:
     if model.startswith("gpt") or model.startswith("o1"):
         return OpenAIAPI(model)
     if model.startswith("claude"):
@@ -176,4 +176,4 @@ def get_chat_api_from_model(model: str) -> ChatAPI:
         return GeminiAPI(model)
     if model == "meta-llama/Meta-Llama-3.1-405B-Instruct":
         return TogetherAPI(model + "-turbo")
-    return LocalAPI(model)
+    return LocalAPI(model, port=port)

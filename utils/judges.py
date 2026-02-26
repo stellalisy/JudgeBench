@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple, Union
+import asyncio
 import re
 
 import utils.prompts as prompts
@@ -617,7 +618,235 @@ class CompassJudger(Judge):
         }
 
 
-def get_judge_from_judge_name_and_model(judge_name: str, judge_model: str) -> Judge:
+class RubricJudge(Judge):
+    """Rubric-based judge: generate a rubric, then score each answer independently."""
+
+    _RUBRIC_GEN_SYS = (
+        "You are an expert evaluator generating rubrics to assess answers to questions.\n\n"
+        "Given a question, generate a comprehensive rubric that can be used to evaluate answers. "
+        "The rubric should:\n"
+        "1. Identify key criteria for a good answer\n"
+        "2. Be specific and measurable\n"
+        "3. Cover the most important aspects of answering the question\n"
+        "4. Include explicit numeric scores for each criterion (e.g., \"Score: 0.3\" or \"Worth 0.25 points\")\n"
+        "5. Ensure all scores sum to exactly 1.0\n\n"
+        "Always include numeric values in your rubric. Generate the rubric directly without JSON formatting."
+    )
+
+    _SCORE_SYS = "You are an expert evaluator judging answers based on a rubric."
+
+    _SCORE_USER_TPL = """Question: {question}
+
+Rubric: {rubric}
+
+Answer to evaluate: {response}
+
+Evaluate the answer based on the rubric. Go through each portion of the rubric and assign a score for each portion following the grading criteria. Then add up the scores to get the total score.
+
+Output ONLY valid JSON in the following format:
+{{
+  "reasoning": "<brief explanation of your evaluation>",
+  "score": <total score (a float between 0.0 to 1.0)>
+}}
+
+Example outputs:
+{{"reasoning": "Answer addresses all key points with accurate details", "score": 0.9}}
+{{"reasoning": "Answer partially satisfies the criteria but missing some critical elements", "score": 0.5}}
+{{"reasoning": "Answer does not meet the criteria", "score": 0.1}}
+
+Your evaluation:"""
+
+    def __init__(self, rubric_model_name: str, judge_model_name: str,
+                 rubric_port: int = 8000, judge_port: int = 8001):
+        from rewardbench.generative_v2_rubric import strip_thinking_tokens
+        from transformers import AutoTokenizer
+
+        self.rubric_model_name = rubric_model_name
+        self.judge_model_name = judge_model_name
+        self.rubric_api = models.get_chat_api_from_model(rubric_model_name, port=rubric_port)
+        self.judge_api = models.get_chat_api_from_model(judge_model_name, port=judge_port)
+        self._rubric_tokenizer = AutoTokenizer.from_pretrained(
+            rubric_model_name, trust_remote_code=True
+        )
+        self._judge_tokenizer = AutoTokenizer.from_pretrained(
+            judge_model_name, trust_remote_code=True
+        )
+        self._strip = strip_thinking_tokens
+
+    async def generate_rubric(self, question: str) -> str:
+        messages = [
+            {"role": "system", "content": self._RUBRIC_GEN_SYS},
+            {"role": "user", "content": question},
+        ]
+        prompt = self._rubric_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt += "\n" + self._RUBRIC_GEN_SYS + "\n"
+        raw = await self.rubric_api.complete(
+            prompt=prompt, temperature=0, top_p=1, max_tokens=2048,
+        )
+        return self._strip(raw)
+
+    @staticmethod
+    def _parse_score(text: str) -> float:
+        if not text or not text.strip():
+            return -1.0
+        m = re.search(r'"score"\s*:\s*([0-9]*\.?[0-9]+)', text.strip())
+        if m:
+            return float(m.group(1))
+        return -1.0
+
+    async def _score_response(self, question: str, rubric: str,
+                               response_text: str) -> Tuple[float, str]:
+        user_prompt = self._SCORE_USER_TPL.format(
+            question=question, rubric=rubric, response=response_text,
+        )
+        messages = [
+            {"role": "system", "content": self._SCORE_SYS},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt = self._judge_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        try:
+            raw = await self.judge_api.complete(
+                prompt=prompt, temperature=0, top_p=1, max_tokens=16384,
+            )
+            cleaned = self._strip(raw)
+            score = self._parse_score(cleaned)
+            return score, cleaned
+        except Exception as e:
+            print(f"RubricJudge: scoring failed: {e}")
+            return -1.0, ""
+
+    async def get_judgment(self, question: str, answer_A: str, answer_B: str,
+                           rubric: str | None = None) -> Dict[str, Any]:
+        if rubric is None:
+            rubric = await self.generate_rubric(question)
+
+        (score_A, raw_A), (score_B, raw_B) = await asyncio.gather(
+            self._score_response(question, rubric, answer_A),
+            self._score_response(question, rubric, answer_B),
+        )
+
+        if score_A < 0 and score_B < 0:
+            decision = None
+        elif score_A > score_B:
+            decision = "A>B"
+        elif score_B > score_A:
+            decision = "B>A"
+        else:
+            decision = "A=B"
+
+        return {
+            "judgment": {
+                "judge_model": self.judge_model_name,
+                "rubric_model": self.rubric_model_name,
+                "rubric": rubric,
+                "score_A": score_A,
+                "score_B": score_B,
+                "raw_judge_A": raw_A,
+                "raw_judge_B": raw_B,
+            },
+            "decision": decision,
+        }
+
+
+class NoRubricJudge(Judge):
+    """Baseline: score responses without rubric generation."""
+
+    _SCORE_SYS = "You are an expert evaluator judging answers based on a rubric."
+
+    _SCORE_USER_TPL = """Question: {question}
+
+Answer to evaluate: {response}
+
+Evaluate the answer based on correctness, completeness, and helpfulness. Go through each aspect and assign a score. Then add up the scores to get the total score.
+
+Output ONLY valid JSON in the following format:
+{{
+  "reasoning": "<brief explanation of your evaluation>",
+  "score": <total score (a float between 0.0 to 1.0)>
+}}
+
+Example outputs:
+{{"reasoning": "Answer addresses all key points with accurate details", "score": 0.9}}
+{{"reasoning": "Answer partially satisfies the criteria but missing some critical elements", "score": 0.5}}
+{{"reasoning": "Answer does not meet the criteria", "score": 0.1}}
+
+Your evaluation:"""
+
+    def __init__(self, judge_model_name: str, judge_port: int = 8001):
+        from rewardbench.generative_v2_rubric import strip_thinking_tokens
+        from transformers import AutoTokenizer
+
+        self.judge_model_name = judge_model_name
+        self.judge_api = models.get_chat_api_from_model(judge_model_name, port=judge_port)
+        self._judge_tokenizer = AutoTokenizer.from_pretrained(
+            judge_model_name, trust_remote_code=True
+        )
+        self._strip = strip_thinking_tokens
+
+    @staticmethod
+    def _parse_score(text: str) -> float:
+        if not text or not text.strip():
+            return -1.0
+        m = re.search(r'"score"\s*:\s*([0-9]*\.?[0-9]+)', text.strip())
+        if m:
+            return float(m.group(1))
+        return -1.0
+
+    async def _score_response(self, question: str, response_text: str) -> Tuple[float, str]:
+        user_prompt = self._SCORE_USER_TPL.format(
+            question=question, response=response_text,
+        )
+        messages = [
+            {"role": "system", "content": self._SCORE_SYS},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt = self._judge_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        try:
+            raw = await self.judge_api.complete(
+                prompt=prompt, temperature=0, top_p=1, max_tokens=16384,
+            )
+            cleaned = self._strip(raw)
+            score = self._parse_score(cleaned)
+            return score, cleaned
+        except Exception as e:
+            print(f"NoRubricJudge: scoring failed: {e}")
+            return -1.0, ""
+
+    async def get_judgment(self, question: str, answer_A: str, answer_B: str,
+                           rubric: str | None = None) -> Dict[str, Any]:
+        (score_A, raw_A), (score_B, raw_B) = await asyncio.gather(
+            self._score_response(question, answer_A),
+            self._score_response(question, answer_B),
+        )
+
+        if score_A < 0 and score_B < 0:
+            decision = None
+        elif score_A > score_B:
+            decision = "A>B"
+        elif score_B > score_A:
+            decision = "B>A"
+        else:
+            decision = "A=B"
+
+        return {
+            "judgment": {
+                "judge_model": self.judge_model_name,
+                "score_A": score_A,
+                "score_B": score_B,
+                "raw_judge_A": raw_A,
+                "raw_judge_B": raw_B,
+            },
+            "decision": decision,
+        }
+
+
+def get_judge_from_judge_name_and_model(judge_name: str, judge_model: str, **kwargs) -> Judge:
     if judge_name == "arena_hard":
         return ArenaHard(judge_model)
     elif judge_name == "vanilla":
@@ -634,6 +863,18 @@ def get_judge_from_judge_name_and_model(judge_name: str, judge_model: str) -> Ju
         return SkyworkCritic(judge_model)
     elif judge_name == "compass_judger":
         return CompassJudger(judge_model)
+    elif judge_name == "rubric":
+        return RubricJudge(
+            rubric_model_name=kwargs["rubric_model_name"],
+            judge_model_name=judge_model,
+            rubric_port=kwargs.get("rubric_port", 8000),
+            judge_port=kwargs.get("judge_port", 8001),
+        )
+    elif judge_name == "no_rubric":
+        return NoRubricJudge(
+            judge_model_name=judge_model,
+            judge_port=kwargs.get("judge_port", 8001),
+        )
     elif judge_name == "reward_model":
         if judge_model in ["internlm/internlm2-7b-reward", "internlm/internlm2-20b-reward"]:
             return InternLM2Reward(judge_model)
