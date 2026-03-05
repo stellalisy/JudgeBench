@@ -142,6 +142,32 @@ class TogetherAPI(ChatAPI):
         return response.choices[0].message.content
     
 
+class AzureOpenAIAPI(ChatAPI):
+    """Azure-hosted OpenAI models, configured via AZURE_API_KEY / AZURE_API_BASE env vars
+    (set by scripts/configure_api.sh)."""
+
+    def __init__(self, model: str):
+        litellm_model = os.environ.get("LITELLM_MODEL", "")
+        if litellm_model.startswith("azure/"):
+            self.model = litellm_model.split("/", 1)[1]
+        else:
+            self.model = model
+        self.client = openai.AsyncAzureOpenAI(
+            api_key=os.environ["AZURE_API_KEY"],
+            azure_endpoint=os.environ["AZURE_API_BASE"],
+            api_version=os.environ.get("AZURE_API_VERSION", "2024-12-01-preview"),
+        )
+
+    @backoff.on_exception(backoff.fibo, (openai.OpenAIError), max_tries=5, max_value=30)
+    async def chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            **kwargs,
+        )
+        return response.choices[0].message.content
+
+
 class LocalAPI(ChatAPI):
 
     def __init__(self, model: str, port: int = 8000):
@@ -168,6 +194,8 @@ class LocalAPI(ChatAPI):
 
 
 def get_chat_api_from_model(model: str, port: int = 8000) -> ChatAPI:
+    if os.environ.get("AZURE_API_KEY") and (model.startswith("gpt") or model.startswith("o1")):
+        return AzureOpenAIAPI(model)
     if model.startswith("gpt") or model.startswith("o1"):
         return OpenAIAPI(model)
     if model.startswith("claude"):

@@ -2,6 +2,15 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple, Union
 import asyncio
 import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from open_instruct.search_rewards.utils.rubric_chat_templates import (
+    DEFAULT_JUDGE_SYSTEM_PROMPT,
+    DEFAULT_RUBRIC_GENERATION_SYSTEM_PROMPT,
+    V0_RUBRIC_GENERATION_SYSTEM_PROMPT,
+)
 
 import utils.prompts as prompts
 import utils.models as models
@@ -621,19 +630,9 @@ class CompassJudger(Judge):
 class RubricJudge(Judge):
     """Rubric-based judge: generate a rubric, then score each answer independently."""
 
-    _RUBRIC_GEN_SYS = (
-        "You are an expert evaluator generating rubrics to assess answers to questions.\n\n"
-        "Given a question, generate a comprehensive rubric that can be used to evaluate answers. "
-        "The rubric should:\n"
-        "1. Identify key criteria for a good answer\n"
-        "2. Be specific and measurable\n"
-        "3. Cover the most important aspects of answering the question\n"
-        "4. Include explicit numeric scores for each criterion (e.g., \"Score: 0.3\" or \"Worth 0.25 points\")\n"
-        "5. Ensure all scores sum to exactly 1.0\n\n"
-        "Always include numeric values in your rubric. Generate the rubric directly without JSON formatting."
-    )
+    _RUBRIC_GEN_SYS = DEFAULT_RUBRIC_GENERATION_SYSTEM_PROMPT
 
-    _SCORE_SYS = "You are an expert evaluator judging answers based on a rubric."
+    _SCORE_SYS = DEFAULT_JUDGE_SYSTEM_PROMPT
 
     _SCORE_USER_TPL = """Question: {question}
 
@@ -641,20 +640,19 @@ Rubric: {rubric}
 
 Answer to evaluate: {response}
 
-Evaluate the answer based on the rubric. Go through each portion of the rubric and assign a score for each portion following the grading criteria. Then add up the scores to get the total score.
+Evaluate the answer against the rubric. For each criterion, decide how well the answer satisfies it (0.0 = not at all, 1.0 = fully), then multiply by the criterion's weight. Sum the weighted scores to get the total (must be between 0.0 and 1.0).
 
-Output ONLY valid JSON in the following format:
-{{
-  "reasoning": "<brief explanation of your evaluation>",
-  "score": <total score (a float between 0.0 to 1.0)>
-}}
+Output ONLY valid JSON:
+{{"reasoning": "<evaluate each criterion, give satisfaction * weight, then sum>", "score": <float 0.0-1.0>}}
 
-Example outputs:
-{{"reasoning": "Answer addresses all key points with accurate details", "score": 0.9}}
-{{"reasoning": "Answer partially satisfies the criteria but missing some critical elements", "score": 0.5}}
-{{"reasoning": "Answer does not meet the criteria", "score": 0.1}}
+Example 1 (rubric: Factual Accuracy 0.4, Completeness 0.35, Clarity 0.25):
+{{"reasoning": "Factual Accuracy (weight 0.4): answer is fully correct, 1.0 * 0.4 = 0.4. Completeness (weight 0.35): covers main points but misses edge cases, 0.6 * 0.35 = 0.21. Clarity (weight 0.25): well organized and easy to follow, 1.0 * 0.25 = 0.25. Total = 0.86", "score": 0.86}}
+Example 2 (rubric: Correctness of Solution 0.5, Use of Examples 0.3, Appropriate Detail 0.2):
+{{"reasoning": "Correctness of Solution (weight 0.5): correct approach but has an arithmetic error in the final step, 0.8 * 0.5 = 0.4. Use of Examples (weight 0.3): no examples provided, 0.0 * 0.3 = 0.0. Appropriate Detail (weight 0.2): gives a brief answer without elaboration, 0.2 * 0.2 = 0.04. Total = 0.44", "score": 0.44}}
 
 Your evaluation:"""
+
+    _API_PREFIXES = ("gpt-", "o1-", "claude-", "gemini-")
 
     def __init__(self, rubric_model_name: str, judge_model_name: str,
                  rubric_port: int = 8000, judge_port: int = 8001):
@@ -663,14 +661,18 @@ Your evaluation:"""
 
         self.rubric_model_name = rubric_model_name
         self.judge_model_name = judge_model_name
+        self._rubric_is_api = any(rubric_model_name.startswith(p) for p in self._API_PREFIXES)
+        self._judge_is_api = any(judge_model_name.startswith(p) for p in self._API_PREFIXES)
         self.rubric_api = models.get_chat_api_from_model(rubric_model_name, port=rubric_port)
         self.judge_api = models.get_chat_api_from_model(judge_model_name, port=judge_port)
-        self._rubric_tokenizer = AutoTokenizer.from_pretrained(
-            rubric_model_name, trust_remote_code=True
-        )
-        self._judge_tokenizer = AutoTokenizer.from_pretrained(
-            judge_model_name, trust_remote_code=True
-        )
+        if not self._rubric_is_api:
+            self._rubric_tokenizer = AutoTokenizer.from_pretrained(
+                rubric_model_name, trust_remote_code=True
+            )
+        if not self._judge_is_api:
+            self._judge_tokenizer = AutoTokenizer.from_pretrained(
+                judge_model_name, trust_remote_code=True
+            )
         self._strip = strip_thinking_tokens
 
     async def generate_rubric(self, question: str) -> str:
@@ -678,13 +680,18 @@ Your evaluation:"""
             {"role": "system", "content": self._RUBRIC_GEN_SYS},
             {"role": "user", "content": question},
         ]
-        prompt = self._rubric_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        prompt += "\n" + self._RUBRIC_GEN_SYS + "\n"
-        raw = await self.rubric_api.complete(
-            prompt=prompt, temperature=0, top_p=1, max_tokens=2048,
-        )
+        if self._rubric_is_api:
+            raw = await self.rubric_api.chat(
+                messages, temperature=0.6, top_p=0.95, max_tokens=16384,
+            )
+        else:
+            prompt = self._rubric_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            prompt += "\n" + self._RUBRIC_GEN_SYS + "\n"
+            raw = await self.rubric_api.complete(
+                prompt=prompt, temperature=0.6, top_p=0.95, max_tokens=16384,
+            )
         return self._strip(raw)
 
     @staticmethod
@@ -705,13 +712,18 @@ Your evaluation:"""
             {"role": "system", "content": self._SCORE_SYS},
             {"role": "user", "content": user_prompt},
         ]
-        prompt = self._judge_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
         try:
-            raw = await self.judge_api.complete(
-                prompt=prompt, temperature=0, top_p=1, max_tokens=16384,
-            )
+            if self._judge_is_api:
+                raw = await self.judge_api.chat(
+                    messages, temperature=0.6, top_p=0.95, max_tokens=16384,
+                )
+            else:
+                prompt = self._judge_tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                raw = await self.judge_api.complete(
+                    prompt=prompt, temperature=0.6, top_p=0.95, max_tokens=16384,
+                )
             cleaned = self._strip(raw)
             score = self._parse_score(cleaned)
             return score, cleaned
@@ -755,7 +767,7 @@ Your evaluation:"""
 class NoRubricJudge(Judge):
     """Baseline: score responses without rubric generation."""
 
-    _SCORE_SYS = "You are an expert evaluator judging answers based on a rubric."
+    _SCORE_SYS = DEFAULT_JUDGE_SYSTEM_PROMPT
 
     _SCORE_USER_TPL = """Question: {question}
 
@@ -809,7 +821,7 @@ Your evaluation:"""
         )
         try:
             raw = await self.judge_api.complete(
-                prompt=prompt, temperature=0, top_p=1, max_tokens=16384,
+                prompt=prompt, temperature=0.6, top_p=0.95, max_tokens=16384,
             )
             cleaned = self._strip(raw)
             score = self._parse_score(cleaned)

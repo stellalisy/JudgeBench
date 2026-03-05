@@ -69,11 +69,14 @@ def main(args: argparse.Namespace) -> None:
 
     dataset_name = os.path.basename(args.pairs).replace(".jsonl", "")
 
-    rubric_model_tag = args.rubric_model.replace("/", "-") if args.rubric_model else "none"
+    if args.rubric_model:
+        rubric_model_tag = os.path.basename(args.rubric_model.rstrip("/")).replace("/", "-")
+    else:
+        rubric_model_tag = "none"
     judge_model_tag = args.judge_model.replace("/", "-")
     file_name = (
-        f"dataset={dataset_name},"
-        f"response_model={args.response_model or 'unknown'},"
+        f"dataset=judgebench,"
+        f"response_model=gpt-4o-2024-05-13,"
         f"judge_name={args.judge_name},"
         f"rubric_model={rubric_model_tag},"
         f"judge_model={judge_model_tag}.jsonl"
